@@ -10,6 +10,21 @@ import { digest, enqueue, leaseMs, Store, type Profile } from "./store.ts";
 import { diffBody, parseChecks } from "./validation.ts";
 
 const command = "evo-skills";
+const subcommands = {
+  status: "Show the queue, usage, and skill revisions",
+  model: "Choose the improvement model",
+  track: "Register a skill to improve",
+  checks: "Set evaluation fixtures",
+  target: "Set the evaluation model",
+  run: "Queue an improvement manually",
+  pause: "Pause new jobs",
+  resume: "Resume new jobs",
+  budget: "Set a worker limit",
+  diff: "Review a proposal and its evaluation",
+  apply: "Adopt a held proposal",
+  reevaluate: "Evaluate a held proposal again",
+  rollback: "Restore an earlier revision",
+};
 const levels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 export default function evoSkills(pi: ExtensionAPI) {
   const agentDir = getAgentDir();
@@ -83,6 +98,13 @@ export default function evoSkills(pi: ExtensionAPI) {
   });
   pi.registerCommand(command, {
     description: "Track, evaluate, and improve skills using a separate model",
+    getArgumentCompletions(prefix) {
+      const input = prefix.trimStart();
+      const items = Object.entries(subcommands)
+        .filter(([name]) => name.startsWith(input))
+        .map(([name, description]) => ({ value: name, label: name, description }));
+      return items.length ? items : null;
+    },
     async handler(input, ctx) {
       const [action] = input.trim().split(/\s+/, 1);
       const arg = input.trim().slice(action.length).trim();
@@ -201,7 +223,7 @@ export default function evoSkills(pi: ExtensionAPI) {
               `${state.calls} calls · ${state.tokens} tokens · $${state.cost.toFixed(4)}`,
               ...Object.values(state.skills).filter((skill) => visible(skill, cwd)).map((skill) => `${skill.name}: active ${skill.active}, session ${selected[skill.id] ?? "not pinned"}`),
               ...recent].join("\n"));
-        } else throw new Error("Commands: model, track, checks, target, run, status, pause, resume, budget, diff, apply, reevaluate, rollback.");
+        } else throw new Error(`Commands: ${Object.keys(subcommands).join(", ")}.`);
         runner?.wake();
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : "Evo Skills failed", "warning");

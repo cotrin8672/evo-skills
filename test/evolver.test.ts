@@ -40,7 +40,11 @@ for (const directory of ["evo-skills", "skill-evolution"]) test(`Pi loads Evo Sk
     });
     try {
       await parent.bindExtensions({ mode: "rpc", uiContext: { setStatus() {} } as Partial<ExtensionUIContext> as ExtensionUIContext });
-      assert.ok(parent.extensionRunner.getRegisteredCommands().some((cmd) => cmd.name === "evo-skills"));
+      const command = parent.extensionRunner.getRegisteredCommands().find((cmd) => cmd.name === "evo-skills");
+      assert.ok(command?.getArgumentCompletions);
+      assert.equal((await command.getArgumentCompletions(""))?.length, 13);
+      assert.deepEqual((await command.getArgumentCompletions("re"))?.map((item) => item.value), ["resume", "reevaluate"]);
+      assert.equal(await command.getArgumentCompletions("run "), null);
       assert.ok(parent.getActiveToolNames().includes("bash"));
       assert.equal(loader.getSkills().skills.find(({ name }) => name === "example")?.filePath, skillPath(store.root, skill, skill.active));
       const result = await isolated("Follow only the maintenance instructions.", "A nonzero exit code was missed.", {
