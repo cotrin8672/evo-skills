@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { collect } from "./collector.ts";
 import { adopt, pins, register, rollback, skillPath, validateFiles, visible } from "./registry.ts";
@@ -25,7 +26,7 @@ const subcommands = {
   reevaluate: "Evaluate a held proposal again",
   rollback: "Restore an earlier revision",
 };
-const levels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export default function evoSkills(pi: ExtensionAPI) {
   const agentDir = getAgentDir();
   let store: Store | undefined;
@@ -36,8 +37,8 @@ export default function evoSkills(pi: ExtensionAPI) {
   let timer: ReturnType<typeof setInterval> | undefined;
   const foreground = randomUUID();
   const availableModels = async () =>
-    (await createRuntime(agentDir, AbortSignal.timeout(30_000))).getAvailableSnapshot().map(modelKey).sort();
-  let modelSuggestions: { until: number; models: Promise<string[]> } | undefined;
+    (await createRuntime(agentDir, AbortSignal.timeout(30_000))).getAvailableSnapshot();
+  let modelSuggestions: { until: number; models: ReturnType<typeof availableModels> } | undefined;
   const profile = (ctx: ExtensionContext): Profile | undefined => ctx.model
     ? { id: modelKey(ctx.model), thinking: ctx.thinkingLevel as Profile["thinking"] } : undefined;
   const status = (ctx: ExtensionContext, message: string) => {
@@ -103,23 +104,29 @@ export default function evoSkills(pi: ExtensionAPI) {
     description: "Track, evaluate, and improve skills using a separate model",
     async getArgumentCompletions(prefix) {
       const input = prefix.trimStart();
-      const target = /^target\s+(\S*)(?:\s+(\S*))?$/.exec(input);
-      const model = /^model\s+(\S*)$/.exec(input);
+      const target = /^target\s+(\S*)$/.exec(input);
+      const selection = /^(model\s+|target\s+\S+\s+)(\S*)(?:\s+(\S*))?$/.exec(input);
       const complete = (start: string, partial: string, choices: string[]) =>
         choices.filter((name) => name.toLowerCase().includes(partial.toLowerCase()))
           .map((name) => ({ value: start + name, label: name }));
-      if (target && target[2] === undefined) {
+      if (target) {
         const skills = Object.values(store?.read().skills ?? {}).filter((skill) => visible(skill, cwd));
         return complete("target ", target[1], skills.map(({ name }) => name).sort());
       }
-      if (model || target?.[2] !== undefined) {
+      if (selection) {
         if (!modelSuggestions || modelSuggestions.until <= Date.now()) {
           modelSuggestions = { until: Date.now() + 30_000, models: availableModels().catch(() => []) };
         }
         const models = await modelSuggestions.models;
-        return model
-          ? complete("model ", model[1], models)
-          : complete(`target ${target![1]} `, target![2], ["origin", ...models]);
+        const [, start, id, effort] = selection;
+        if (effort !== undefined) {
+          const model = models.find((item) => modelKey(item) === id);
+          return model ? getSupportedThinkingLevels(model)
+            .filter((level) => level.startsWith(effort.toLowerCase()))
+            .map((level) => ({ value: `${start}${id} ${level}`, label: level })) : null;
+        }
+        const choices = models.map(modelKey).sort();
+        return complete(start, id, start.startsWith("target") ? ["origin", ...choices] : choices);
       }
       const items = Object.entries(subcommands)
         .filter(([name]) => name.startsWith(input))
@@ -141,7 +148,7 @@ export default function evoSkills(pi: ExtensionAPI) {
           return skill;
         };
         if (action === "model") {
-          const choices = await availableModels();
+          const choices = (await availableModels()).map(modelKey).sort();
           if (!choices.length) throw new Error("No models available in Pi's standalone configuration.");
           const id = name || await ctx.ui.select("Evo Skills model", choices);
           if (!id) return;
@@ -170,7 +177,7 @@ export default function evoSkills(pi: ExtensionAPI) {
           const [id, level, extra] = (detail ?? "").split(/\s+/);
           const thinking = level ? levels.find((value) => value === level) : undefined;
           if (!id || extra || (level && !thinking)) throw new Error("Usage: target <skill> <provider/model-id|origin> [thinking]");
-          if (id !== "origin" && !(await availableModels()).includes(id))
+          if (id !== "origin" && !(await availableModels()).some((model) => modelKey(model) === id))
             throw new Error("The evaluation model is not available.");
           db.update((data) => { data.skills[skill.id].target = id === "origin" ? undefined : { id, thinking }; });
           notify(`${skill.name}: evaluation model ${id}.`);

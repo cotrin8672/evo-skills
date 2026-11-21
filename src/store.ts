@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 export const digest = (value: string) => createHash("sha256").update(value).digest("hex");
-export type Profile = { id: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" };
+export type Profile = { id: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" };
 export type Check = { kind: "regression" | "repair" | "non_applicable"; task: string; includes: string[]; excludes?: string[] };
 export type Skill = { id: string; name: string; original: string; scope: string; active: string; checks: Check[]; target?: Profile };
 export type Evidence = {
