@@ -67,7 +67,7 @@ export async function register(store: Store, path: string, cwd: string, agentDir
   const initial = await lstat(original);
   if (!initial.isFile() || initial.size > 48 * 1024) throw new Error("Expected a regular SKILL.md no larger than 48 KiB.");
   const name = parseFrontmatter<SkillFrontmatter>(await readFile(original, "utf8")).frontmatter.name;
-  if (!name || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name) || name.length > 64 || name === "skill-evolution")
+  if (!name || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name) || name.length > 64 || name === "evo-skills")
     throw new Error("Choose a skill with a valid, non-reserved name in its frontmatter.");
   if (discovered.some((item) => item.name === name))
     throw new Error(`Exclude the original skill from Pi discovery and reload first (skills entry: ${JSON.stringify(`-${original}`)}).`);
@@ -127,7 +127,7 @@ export async function validateFiles(path: string, name: string, content: string)
     if (/^[a-z]+:/i.test(destination) || !inside(file, target) || !inside(file, await realpath(target)))
       throw new Error(`Invalid or external skill reference: ${destination}`);
   }
-  const loaded = loadSkillsFromDir({ dir: file, source: "skill-evolution" });
+  const loaded = loadSkillsFromDir({ dir: file, source: "evo-skills" });
   if (!loaded.skills.some((skill) => skill.name === name && resolve(skill.filePath) === resolve(path)) || loaded.diagnostics.length)
     throw new Error("Pi rejected the skill metadata.");
 }

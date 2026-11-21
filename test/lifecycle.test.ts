@@ -16,7 +16,7 @@ const source = "---\nname: example\ndescription: Example procedure\n---\nUse the
 const candidate = source.replace("the old procedure", "the revised procedure");
 
 async function setup() {
-  const root = await mkdtemp(join(tmpdir(), "pi-evolution-life-"));
+  const root = await mkdtemp(join(tmpdir(), "evo-skills-life-"));
   const cwd = join(root, "project");
   const original = join(cwd, "example", "SKILL.md");
   await mkdir(join(cwd, "example"), { recursive: true });

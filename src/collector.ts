@@ -4,7 +4,9 @@ import { skillPath, visible } from "./registry.ts";
 import { digest, enqueue, type Evidence, type Profile, type Store } from "./store.ts";
 
 type Entry = ReturnType<ExtensionContext["sessionManager"]["getBranch"]>[number];
-const boundary = "pi-skill-evolution:boundary";
+const boundary = "evo-skills:boundary";
+const isBoundary = (entry: Entry) => entry.type === "custom" &&
+  (entry.customType === boundary || entry.customType === "pi-skill-evolution:boundary");
 const text = (value: unknown, max = 1200) => typeof value === "string" ? value.slice(0, max)
   .replace(/\b(?:sk-[\w-]{16,}|gh[pousr]_[\w]+|github_pat_[\w]+|Bearer\s+[\w.-]+)\b/gi, "[redacted]")
   .replace(/((?:api[_-]?key|password|token|secret)\s*[=:]\s*)[^\s,;]+/gi, "$1[redacted]") : "";
@@ -43,8 +45,8 @@ export function evidenceText(item: Evidence) {
 export function collect(store: Store, ctx: ExtensionContext, pin: Record<string, string>, target: Profile | undefined, aborted: boolean, append: (id: string) => void) {
   const branch = ctx.sessionManager.getBranch();
   const end = branch.at(-1);
-  if (!end || (end.type === "custom" && end.customType === boundary)) return;
-  const index = branch.findLastIndex((entry) => entry.type === "custom" && entry.customType === boundary);
+  if (!end || isBoundary(end)) return;
+  const index = branch.findLastIndex(isBoundary);
   const latest = branch.slice(index + 1).filter((entry) => entry.type === "message");
   if (!latest.some((entry) => entry.message.role === "user")) return;
 

@@ -10,11 +10,11 @@ import { isolated } from "../src/evolver.ts";
 import { register, skillPath } from "../src/registry.ts";
 import { Store } from "../src/store.ts";
 
-test("Pi loads the package; a separate tool-free SDK worker leaves the parent chat unchanged", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-skill-evolution-"));
+for (const directory of ["evo-skills", "skill-evolution"]) test(`Pi loads Evo Skills with the ${directory} store and keeps the worker separate`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "evo-skills-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = dir;
-  const store = new Store(join(dir, "skill-evolution"));
+  const store = new Store(join(dir, directory));
   try {
     const faux = fauxProvider({ tokensPerSecond: Infinity });
     faux.setResponses([fauxAssistantMessage("Check the exit code first.")]);
@@ -40,7 +40,7 @@ test("Pi loads the package; a separate tool-free SDK worker leaves the parent ch
     });
     try {
       await parent.bindExtensions({ mode: "rpc", uiContext: { setStatus() {} } as Partial<ExtensionUIContext> as ExtensionUIContext });
-      assert.ok(parent.extensionRunner.getRegisteredCommands().some((cmd) => cmd.name === "skill-evolution"));
+      assert.ok(parent.extensionRunner.getRegisteredCommands().some((cmd) => cmd.name === "evo-skills"));
       assert.ok(parent.getActiveToolNames().includes("bash"));
       assert.equal(loader.getSkills().skills.find(({ name }) => name === "example")?.filePath, skillPath(store.root, skill, skill.active));
       const result = await isolated("Follow only the maintenance instructions.", "A nonzero exit code was missed.", {
@@ -50,11 +50,15 @@ test("Pi loads the package; a separate tool-free SDK worker leaves the parent ch
       assert.deepEqual(parent.messages, []);
       faux.setResponses([fauxAssistantMessage("I checked the exit code."), fauxAssistantMessage("I'll distinguish failure from success.")]);
       await parent.prompt("/skill:example Review the task.", { source: "rpc" });
+      const boundary = directory === "skill-evolution"
+        ? parent.sessionManager.appendCustomEntry("pi-skill-evolution:boundary")
+        : parent.sessionManager.getLeafId();
       await parent.prompt("Correction: the nonzero exit code indicates a failure.", { source: "rpc" });
       const observations = Object.values(store.read().evidence);
       assert.equal(observations.length, 2);
       assert.match(observations[0].usage, /expanded/);
       assert.equal(observations[1].previous, observations[0].id);
+      assert.equal(observations[1].from, boundary);
       assert.match(observations[1].text ?? "", /Correction/);
     } finally {
       await parent.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });

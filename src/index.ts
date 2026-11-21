@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -8,9 +9,9 @@ import { createRuntime, modelKey, scheduler } from "./scheduler.ts";
 import { digest, enqueue, leaseMs, Store, type Profile } from "./store.ts";
 import { diffBody, parseChecks } from "./validation.ts";
 
-const command = "skill-evolution";
+const command = "evo-skills";
 const levels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-export default function skillEvolution(pi: ExtensionAPI) {
+export default function evoSkills(pi: ExtensionAPI) {
   const agentDir = getAgentDir();
   let store: Store | undefined;
   let runner: ReturnType<typeof scheduler> | undefined;
@@ -22,7 +23,7 @@ export default function skillEvolution(pi: ExtensionAPI) {
   const profile = (ctx: ExtensionContext): Profile | undefined => ctx.model
     ? { id: modelKey(ctx.model), thinking: ctx.thinkingLevel as Profile["thinking"] } : undefined;
   const status = (ctx: ExtensionContext, message: string) => {
-    if (ctx.hasUI) ctx.ui.setStatus(command, `Skill Evolution: ${message}`);
+    if (ctx.hasUI) ctx.ui.setStatus(command, `Evo Skills: ${message}`);
   };
   const markForeground = () => { store?.update((state) => { state.foreground[foreground] = Date.now() + leaseMs; }); };
   const clearForeground = () => {
@@ -32,7 +33,10 @@ export default function skillEvolution(pi: ExtensionAPI) {
   };
   pi.on("session_start", async (event, ctx) => {
     cwd = await realpath(ctx.cwd).catch(() => ctx.cwd);
-    const db = store = new Store(join(agentDir, command));
+    const root = join(agentDir, command);
+    const legacy = join(agentDir, "skill-evolution");
+    // Existing sessions pin real file paths, so leave their store where it is.
+    const db = store = new Store(!existsSync(root) && existsSync(legacy) ? legacy : root);
     selected = db.update((data) => pins(data, ctx.sessionManager.getSessionId(), cwd,
       ctx.sessionManager.getSessionFile(), event.previousSessionFile, event.reason === "fork"));
     runner = scheduler(db, agentDir, (message) => status(ctx, message));
@@ -84,7 +88,7 @@ export default function skillEvolution(pi: ExtensionAPI) {
       const arg = input.trim().slice(action.length).trim();
       const [name, detail] = /^(\S+)(?:\s+([\s\S]+))?$/.exec(arg)?.slice(1) ?? [];
       try {
-        if (!store) throw new Error("Skill Evolution is not initialized.");
+        if (!store) throw new Error("Evo Skills is not initialized.");
         const db = store;
         const state = db.read();
         const notify = (message: string) => ctx.ui.notify(message, "info");
@@ -96,14 +100,14 @@ export default function skillEvolution(pi: ExtensionAPI) {
         if (action === "model") {
           const runtime = await createRuntime(agentDir, AbortSignal.timeout(30_000));
           const choices = runtime.getAvailableSnapshot().map(modelKey).sort();
-          const id = name || await ctx.ui.select("Skill Evolution model", choices);
+          const id = name || await ctx.ui.select("Evo Skills model", choices);
           if (!choices.length) throw new Error("No models available in Pi's standalone configuration.");
           if (!id) return;
           if (!choices.includes(id)) throw new Error("Model is not available to the improvement session.");
           const thinking = detail ? levels.find((value) => value === detail) : undefined;
           if (detail && !thinking) throw new Error(`Thinking level must be one of: ${levels.join(", ")}`);
           db.update((data) => { data.config.model = { id, thinking }; });
-          notify(`Skill Evolution model: ${id}`);
+          notify(`Evo Skills model: ${id}`);
         } else if (action === "track") {
           if (!arg) throw new Error("Provide the path to SKILL.md.");
           const discovered = pi.getCommands().filter((cmd) => cmd.source === "skill")
@@ -142,7 +146,7 @@ export default function skillEvolution(pi: ExtensionAPI) {
           notify(`Queued ${skill.name}: ${job}`);
         } else if (action === "pause" || action === "resume") {
           db.update((data) => { data.config.paused = action === "pause"; });
-          notify(action === "pause" ? "New Skill Evolution jobs are paused." : "Skill Evolution resumed.");
+          notify(action === "pause" ? "New Evo Skills jobs are paused." : "Evo Skills resumed.");
         } else if (action === "budget") {
           const keys = { jobsPerDay: [1, 100], callsPerJob: [1, 100], outputTokens: [128, 32768],
             timeoutMs: [1000, 3_600_000], idleMs: [0, 300_000], cooldownMs: [0, 86_400_000] } as const;
@@ -182,7 +186,7 @@ export default function skillEvolution(pi: ExtensionAPI) {
             const before = skillPath(db.root, skill, job.base);
             const details = `${job.state}: ${job.rationale ?? job.note ?? ""}\nEvidence: ${job.usedEvidence?.join(", ") ?? ""}\n${JSON.stringify(job.validation ?? {})}\n\nBefore: ${before}\nAfter: ${path}`;
             const [oldText, newText] = await Promise.all([readFile(before, "utf8"), readFile(path, "utf8")]);
-            await ctx.ui.editor("Skill Evolution comparison (review only)",
+            await ctx.ui.editor("Evo Skills comparison (review only)",
               `${details}\n\n${diffBody(oldText, newText)}`);
           }
         } else if (action === "rollback") {
@@ -192,7 +196,7 @@ export default function skillEvolution(pi: ExtensionAPI) {
         } else if (!action || action === "status") {
           const recent = Object.values(state.jobs).filter((job) => state.skills[job.skill] && visible(state.skills[job.skill], cwd))
             .slice(-12).reverse().map((job) => `${state.skills[job.skill].name} ${job.state} ${job.id}${job.note ? ` · ${job.note}` : ""}`);
-          await ctx.ui.editor("Skill Evolution status (review only)",
+          await ctx.ui.editor("Evo Skills status (review only)",
             [`${state.config.paused ? "Paused" : "Enabled"} · model: ${state.config.model?.id ?? "not configured"}`,
               `${state.calls} calls · ${state.tokens} tokens · $${state.cost.toFixed(4)}`,
               ...Object.values(state.skills).filter((skill) => visible(skill, cwd)).map((skill) => `${skill.name}: active ${skill.active}, session ${selected[skill.id] ?? "not pinned"}`),
@@ -200,7 +204,7 @@ export default function skillEvolution(pi: ExtensionAPI) {
         } else throw new Error("Commands: model, track, checks, target, run, status, pause, resume, budget, diff, apply, reevaluate, rollback.");
         runner?.wake();
       } catch (error) {
-        ctx.ui.notify(error instanceof Error ? error.message : "Skill Evolution failed", "warning");
+        ctx.ui.notify(error instanceof Error ? error.message : "Evo Skills failed", "warning");
       }
     },
   });

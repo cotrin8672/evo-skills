@@ -1,5 +1,5 @@
 ---
-name: skill-evolution
+name: evo-skills
 description: Propose small, evidence-based improvements to a skill.
 ---
 
