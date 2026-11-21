@@ -30,6 +30,9 @@ for (const directory of ["evo-skills", "skill-evolution"]) test(`Pi loads Evo Sk
 
     const pkg = fileURLToPath(new URL("../", import.meta.url));
     await writeFile(join(dir, "settings.json"), JSON.stringify({ packages: [pkg] }));
+    await writeFile(join(dir, "models.json"), JSON.stringify({ providers: { "evo-test": {
+      baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", apiKey: "fixture", models: [{ id: "local-model" }],
+    } } }));
     const settingsManager = SettingsManager.create(dir, dir);
     const loader = new DefaultResourceLoader({ cwd: project, agentDir: dir, settingsManager });
     await loader.reload();
@@ -45,6 +48,10 @@ for (const directory of ["evo-skills", "skill-evolution"]) test(`Pi loads Evo Sk
       assert.equal((await command.getArgumentCompletions(""))?.length, 13);
       assert.deepEqual((await command.getArgumentCompletions("re"))?.map((item) => item.value), ["resume", "reevaluate"]);
       assert.equal(await command.getArgumentCompletions("run "), null);
+      assert.deepEqual((await command.getArgumentCompletions("model local-model"))?.map((item) => item.value), ["model evo-test/local-model"]);
+      assert.deepEqual((await command.getArgumentCompletions("target ex"))?.map((item) => item.value), ["target example"]);
+      assert.deepEqual((await command.getArgumentCompletions("target example evo-test/"))?.map((item) => item.value), ["target example evo-test/local-model"]);
+      assert.deepEqual((await command.getArgumentCompletions("target example orig"))?.map((item) => item.value), ["target example origin"]);
       assert.ok(parent.getActiveToolNames().includes("bash"));
       assert.equal(loader.getSkills().skills.find(({ name }) => name === "example")?.filePath, skillPath(store.root, skill, skill.active));
       const result = await isolated("Follow only the maintenance instructions.", "A nonzero exit code was missed.", {
