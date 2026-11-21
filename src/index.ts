@@ -1,117 +1,204 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
-import { type ExtensionAPI, getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { evolve, readSkill } from "./evolver.ts";
+import { readFile, realpath } from "node:fs/promises";
+import { join, resolve, sep } from "node:path";
+import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { collect } from "./collector.ts";
+import { adopt, pins, register, rollback, skillPath, validateFiles, visible } from "./registry.ts";
+import { createRuntime, modelKey, scheduler } from "./scheduler.ts";
+import { digest, enqueue, leaseMs, Store, type Profile } from "./store.ts";
+import { diffBody, parseChecks } from "./validation.ts";
 
 const command = "skill-evolution";
-
-async function selectedModel(file: string): Promise<string | undefined> {
-  const value = await readFile(file, "utf8").catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== "ENOENT") throw error;
-  });
-  return value?.trim() || undefined;
-}
-
+const levels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 export default function skillEvolution(pi: ExtensionAPI) {
   const agentDir = getAgentDir();
-  const stateDir = join(agentDir, command);
-  const modelFile = join(stateDir, "model");
-  const modelRuntime = (signal?: AbortSignal) =>
-    ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json"), signal });
-  let job: AbortController | undefined;
-  let status = "Idle";
-  let closed = false;
-
+  let store: Store | undefined;
+  let runner: ReturnType<typeof scheduler> | undefined;
+  let selected: Record<string, string> = {};
+  let cwd = "";
+  let activeInput = false;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const foreground = randomUUID();
+  const profile = (ctx: ExtensionContext): Profile | undefined => ctx.model
+    ? { id: modelKey(ctx.model), thinking: ctx.thinkingLevel as Profile["thinking"] } : undefined;
+  const status = (ctx: ExtensionContext, message: string) => {
+    if (ctx.hasUI) ctx.ui.setStatus(command, `Skill Evolution: ${message}`);
+  };
+  const markForeground = () => { store?.update((state) => { state.foreground[foreground] = Date.now() + leaseMs; }); };
+  const clearForeground = () => {
+    clearInterval(timer);
+    timer = undefined;
+    store?.update((state) => { delete state.foreground[foreground]; });
+  };
+  pi.on("session_start", async (event, ctx) => {
+    cwd = await realpath(ctx.cwd).catch(() => ctx.cwd);
+    const db = store = new Store(join(agentDir, command));
+    selected = db.update((data) => pins(data, ctx.sessionManager.getSessionId(), cwd,
+      ctx.sessionManager.getSessionFile(), event.previousSessionFile, event.reason === "fork"));
+    runner = scheduler(db, agentDir, (message) => status(ctx, message));
+    runner.wake();
+  });
+  pi.on("resources_discover", (_event, ctx) => {
+    const data = store?.read();
+    const ordinary = new Set(pi.getCommands().filter((cmd) => cmd.source === "skill").map((cmd) => cmd.name));
+    const skillPaths = [];
+    for (const [id, revision] of Object.entries(selected)) {
+      const skill = data?.skills[id];
+      if (!skill || !visible(skill, cwd)) continue;
+      if (ordinary.has(`skill:${skill.name}`)) status(ctx, `Duplicate skill ${skill.name}; exclude its original and reload.`);
+      else if (store) skillPaths.push(skillPath(store.root, skill, revision));
+    }
+    return { skillPaths };
+  });
+  pi.on("input", (event) => { if (event.source !== "extension") activeInput = true; });
+  pi.on("agent_start", (_event, ctx) => {
+    if (!ctx.hasUI || timer) return;
+    markForeground();
+    timer = setInterval(() => { try { markForeground(); } catch { /* Lease expires on shutdown. */ } }, 5_000);
+    timer.unref();
+  });
+  pi.on("session_tree", () => { activeInput = false; });
+  pi.on("agent_settled", (event, ctx) => {
+    try {
+      if (store && activeInput && ctx.hasUI)
+        collect(store, ctx, selected, profile(ctx), event.aborted, (type) => pi.appendEntry(type));
+    } catch {
+      status(ctx, "Could not record skill usage");
+    } finally {
+      activeInput = false;
+      clearForeground();
+      runner?.wake();
+    }
+  });
   pi.on("session_shutdown", () => {
-    closed = true;
-    job?.abort();
+    try { clearForeground(); } finally {
+      void runner?.close().catch(() => {});
+      runner = undefined;
+      store = undefined;
+    }
   });
   pi.registerCommand(command, {
-    description: "Choose an improvement model or propose a revision to a SKILL.md",
+    description: "Track, evaluate, and improve skills using a separate model",
     async handler(input, ctx) {
       const [action] = input.trim().split(/\s+/, 1);
       const arg = input.trim().slice(action.length).trim();
+      const [name, detail] = /^(\S+)(?:\s+([\s\S]+))?$/.exec(arg)?.slice(1) ?? [];
       try {
+        if (!store) throw new Error("Skill Evolution is not initialized.");
+        const db = store;
+        const state = db.read();
+        const notify = (message: string) => ctx.ui.notify(message, "info");
+        const find = () => {
+          const skill = Object.values(state.skills).find((item) => item.name === name && visible(item, cwd));
+          if (!skill) throw new Error(`Unknown managed skill: ${name ?? "(missing)"}`);
+          return skill;
+        };
         if (action === "model") {
-          const current = await selectedModel(modelFile);
-          const runtime = await modelRuntime();
-          const choices = [...new Set(runtime.getAvailableSnapshot().map((model) => `${model.provider}/${model.id}`))].sort();
-          if (!choices.length) throw new Error("No models are available in the standalone Pi model configuration.");
-          const choice = arg || (await ctx.ui.select(`Improvement model${current ? ` (current: ${current})` : ""}`, choices));
-          if (!choice) return;
-          if (!choices.includes(choice)) throw new Error("Model is not available to the improvement session.");
-          await mkdir(stateDir, { recursive: true });
-          const temp = join(stateDir, `model-${randomUUID()}.tmp`);
-          try {
-            await writeFile(temp, choice + "\n", { flag: "wx", mode: 0o600 });
-            await rename(temp, modelFile);
-          } finally {
-            await rm(temp, { force: true });
+          const runtime = await createRuntime(agentDir, AbortSignal.timeout(30_000));
+          const choices = runtime.getAvailableSnapshot().map(modelKey).sort();
+          const id = name || await ctx.ui.select("Skill Evolution model", choices);
+          if (!choices.length) throw new Error("No models available in Pi's standalone configuration.");
+          if (!id) return;
+          if (!choices.includes(id)) throw new Error("Model is not available to the improvement session.");
+          const thinking = detail ? levels.find((value) => value === detail) : undefined;
+          if (detail && !thinking) throw new Error(`Thinking level must be one of: ${levels.join(", ")}`);
+          db.update((data) => { data.config.model = { id, thinking }; });
+          notify(`Skill Evolution model: ${id}`);
+        } else if (action === "track") {
+          if (!arg) throw new Error("Provide the path to SKILL.md.");
+          const discovered = pi.getCommands().filter((cmd) => cmd.source === "skill")
+            .filter((cmd) => !resolve(cmd.sourceInfo.path).startsWith(resolve(db.root) + sep))
+            .map((cmd) => ({ name: cmd.name.replace(/^skill:/, "") }));
+          const skill = await register(db, resolve(cwd, arg), cwd, agentDir, discovered);
+          notify(`Tracking ${skill.name} at ${skill.active}. New sessions will use the managed copy.`);
+        } else if (action === "checks") {
+          const skill = find();
+          if (!detail) throw new Error("Usage: checks <skill> <fixtures.json>");
+          const raw = await readFile(resolve(cwd, detail), "utf8");
+          if (raw.length > 64 * 1024) throw new Error("Fixtures exceed 64 KiB.");
+          const checks = parseChecks(JSON.parse(raw));
+          db.update((data) => { data.skills[skill.id].checks = checks; });
+          notify(`${skill.name}: saved ${checks.length} evaluation cases for future jobs.`);
+        } else if (action === "target") {
+          const skill = find();
+          const [id, level, extra] = (detail ?? "").split(/\s+/);
+          const thinking = level ? levels.find((value) => value === level) : undefined;
+          if (!id || extra || (level && !thinking)) throw new Error("Usage: target <skill> <provider/model-id|origin> [thinking]");
+          if (id !== "origin" && !(await createRuntime(agentDir, AbortSignal.timeout(30_000))).getAvailableSnapshot().some((model) => modelKey(model) === id))
+            throw new Error("The evaluation model is not available.");
+          db.update((data) => { data.skills[skill.id].target = id === "origin" ? undefined : { id, thinking }; });
+          notify(`${skill.name}: evaluation model ${id}.`);
+        } else if (action === "run") {
+          const skill = find();
+          const text = (await ctx.ui.input("Observation (will be sent to the improvement model)"))?.trim();
+          if (!text) return;
+          if (text.length > 4_000) throw new Error("Observation exceeds 4,000 characters.");
+          const id = digest(randomUUID());
+          const job = db.update((data) => enqueue(data, {
+            id, skill: skill.id, base: selected[skill.id] ?? skill.active, cwd, session: ctx.sessionManager.getSessionId(),
+            through: id, usage: "explicitly requested improvement", text, target: profile(ctx),
+          }, Date.now(), true));
+          if (!job) throw new Error("This session is pinned to an older revision. Start a new session to improve the active version.");
+          notify(`Queued ${skill.name}: ${job}`);
+        } else if (action === "pause" || action === "resume") {
+          db.update((data) => { data.config.paused = action === "pause"; });
+          notify(action === "pause" ? "New Skill Evolution jobs are paused." : "Skill Evolution resumed.");
+        } else if (action === "budget") {
+          const keys = { jobsPerDay: [1, 100], callsPerJob: [1, 100], outputTokens: [128, 32768],
+            timeoutMs: [1000, 3_600_000], idleMs: [0, 300_000], cooldownMs: [0, 86_400_000] } as const;
+          if (!name || !Object.hasOwn(keys, name)) throw new Error(`Usage: budget <${Object.keys(keys).join("|")}> <integer>`);
+          const key = name as keyof typeof keys;
+          const [min, max] = keys[key], n = Number(detail);
+          if (!detail || !Number.isSafeInteger(n) || n < min || n > max) throw new Error(`Enter an integer from ${min} to ${max}.`);
+          db.update((data) => { data.config[key] = n; });
+          notify(`${key} = ${n}`);
+        } else if (action === "diff" || action === "apply" || action === "reevaluate") {
+          const job = name && Object.hasOwn(state.jobs, name) ? state.jobs[name] : undefined;
+          const skill = job && state.skills[job.skill];
+          if (!job?.candidate || !skill || !visible(skill, cwd)) throw new Error("No visible candidate for that job.");
+          const path = skillPath(db.root, skill, job.candidate);
+          if (action === "reevaluate") {
+            db.update((data) => {
+              const current = data.jobs[job.id];
+              if (current.state !== "candidate" || data.skills[skill.id]?.active !== current.base)
+                throw new Error("Only a held candidate based on the active revision can be evaluated again.");
+              current.state = "queued";
+              current.due = Date.now();
+              current.checks = data.skills[skill.id].checks;
+              current.target = data.skills[skill.id].target ?? current.target;
+              current.calls = 0;
+            });
+            notify(`Queued evaluation for ${job.id}.`);
+          } else if (action === "apply") {
+            if (job.state !== "candidate") throw new Error("Only validated, held candidates can be applied.");
+            await validateFiles(path, skill.name, await readFile(path, "utf8"));
+            const applied = db.update((data) => {
+              const current = data.jobs[job.id];
+              return current.state === "candidate" && adopt(data, current, job.candidate!);
+            });
+            if (!applied) throw new Error("The base revision changed; candidate not applied.");
+            notify(`Published ${skill.name}; existing sessions keep their assigned revisions.`);
+          } else {
+            const before = skillPath(db.root, skill, job.base);
+            const details = `${job.state}: ${job.rationale ?? job.note ?? ""}\nEvidence: ${job.usedEvidence?.join(", ") ?? ""}\n${JSON.stringify(job.validation ?? {})}\n\nBefore: ${before}\nAfter: ${path}`;
+            const [oldText, newText] = await Promise.all([readFile(before, "utf8"), readFile(path, "utf8")]);
+            await ctx.ui.editor("Skill Evolution comparison (review only)",
+              `${details}\n\n${diffBody(oldText, newText)}`);
           }
-          ctx.ui.notify(`Skill Evolution model: ${choice}`, "info");
-          return;
-        }
-        if (action === "status") {
-          ctx.ui.notify(`Skill Evolution · ${status} · model: ${(await selectedModel(modelFile)) ?? "not configured"}`, "info");
-          return;
-        }
-        if (action !== "run" || !arg) {
-          ctx.ui.notify("Usage: /skill-evolution model [provider/model-id] | run <path to SKILL.md> | status", "info");
-          return;
-        }
-        if (job) throw new Error("An improvement is already running in this session.");
-        const modelId = await selectedModel(modelFile);
-        if (!modelId) throw new Error("Choose an improvement model with /skill-evolution model first.");
-        const path = resolve(ctx.cwd, arg);
-        const evidence = (await ctx.ui.input("What should improve? This note and the selected skill will be sent to the improvement model."))?.trim();
-        if (!evidence) return;
-        if (evidence.length > 4_000) throw new Error("Keep the observation under 4,000 characters.");
-        if (job) throw new Error("An improvement is already running in this session.");
-
-        const source = await readSkill(path);
-        if (closed) return;
-        if (job) throw new Error("An improvement is already running in this session.");
-        const controller = new AbortController();
-        job = controller;
-        const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]);
-        const ui = ctx.ui;
-        const cwd = ctx.cwd;
-        status = `Running with ${modelId}`;
-        void (async () => {
-          let pendingDir: string | undefined;
-          try {
-            ui.setStatus(command, `Skill Evolution: ${status}`);
-            const runtime = await modelRuntime(signal);
-            const model = runtime.getAvailableSnapshot().find((item) => `${item.provider}/${item.id}` === modelId);
-            if (!model) {
-              status = `Unavailable model: ${modelId}`;
-              return;
-            }
-            const candidate = await evolve(source, evidence, { cwd, model, modelRuntime: runtime, signal });
-            signal.throwIfAborted();
-            if (!candidate) {
-              status = "No change proposed";
-              return;
-            }
-            const proposals = join(stateDir, "proposals");
-            await mkdir(proposals, { recursive: true });
-            pendingDir = await mkdtemp(join(proposals, ".pending-"));
-            await writeFile(join(pendingDir, "before.md"), source, { mode: 0o600 });
-            await writeFile(join(pendingDir, "after.md"), candidate, { mode: 0o600 });
-            signal.throwIfAborted();
-            const destination = join(proposals, randomUUID());
-            await rename(pendingDir, destination);
-            pendingDir = undefined;
-            status = `Proposal: ${destination}`;
-          } catch {
-            status = signal.aborted ? "Interrupted or timed out" : "Failed to generate or save a valid proposal";
-          } finally {
-            if (pendingDir) await rm(pendingDir, { recursive: true, force: true }).catch(() => {});
-            job = undefined;
-            if (!controller.signal.aborted) ui.setStatus(command, `Skill Evolution: ${status}`);
-          }
-        })().catch(() => {});
+        } else if (action === "rollback") {
+          if (!detail) throw new Error("Usage: rollback <skill> <revision>");
+          await rollback(db, find(), detail);
+          notify("Rolled back the active revision for new sessions.");
+        } else if (!action || action === "status") {
+          const recent = Object.values(state.jobs).filter((job) => state.skills[job.skill] && visible(state.skills[job.skill], cwd))
+            .slice(-12).reverse().map((job) => `${state.skills[job.skill].name} ${job.state} ${job.id}${job.note ? ` · ${job.note}` : ""}`);
+          await ctx.ui.editor("Skill Evolution status (review only)",
+            [`${state.config.paused ? "Paused" : "Enabled"} · model: ${state.config.model?.id ?? "not configured"}`,
+              `${state.calls} calls · ${state.tokens} tokens · $${state.cost.toFixed(4)}`,
+              ...Object.values(state.skills).filter((skill) => visible(skill, cwd)).map((skill) => `${skill.name}: active ${skill.active}, session ${selected[skill.id] ?? "not pinned"}`),
+              ...recent].join("\n"));
+        } else throw new Error("Commands: model, track, checks, target, run, status, pause, resume, budget, diff, apply, reevaluate, rollback.");
+        runner?.wake();
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : "Skill Evolution failed", "warning");
       }

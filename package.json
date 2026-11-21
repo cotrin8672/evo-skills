@@ -1,7 +1,7 @@
 {
   "name": "pi-skill-evolution",
   "version": "0.1.0",
-  "description": "Review-ready Pi skill improvements in a separate, tool-free session",
+  "description": "Evidence-based skill improvements with isolated workers and versioned adoption",
   "type": "module",
   "packageManager": "pnpm@12.6.0",
   "keywords": ["pi-package"],
@@ -13,16 +13,18 @@
     "lint": "oxlint --deny-warnings src test",
     "typecheck": "tsrs --noEmit",
     "test": "bun test",
-    "check": "pnpm lint && pnpm typecheck && pnpm test"
+    "check": "oxlint --deny-warnings src test && tsrs --noEmit && bun test"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "1.5.2",
     "@earendil-works/pi-coding-agent": "1.5.2",
     "@types/node": "^24.0.0",
     "oxlint": "1.94.0",
-    "tsrs": "7.1.0-beta.tsrs2"
+    "tsrs": "7.1.0-beta.tsrs2",
+    "typebox": "1.3.27"
   }
 }
