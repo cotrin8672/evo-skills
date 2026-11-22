@@ -1,7 +1,9 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { loadSkillsFromDir, parseFrontmatter, type SkillFrontmatter } from "@earendil-works/pi-coding-agent";
+import { homedir } from "node:os";
+import { type ExtensionAPI, loadSkillsFromDir, parseFrontmatter, type SkillFrontmatter } from "@earendil-works/pi-coding-agent";
 import { digest, type Data, type Job, type Skill, type Store } from "./store.ts";
 
 const inside = (base: string, path: string) => {
@@ -12,6 +14,8 @@ export const skillPath = (root: string, skill: Skill, revision: string) =>
   join(root, "skills", skill.id, "revisions", revision, skill.name, "SKILL.md");
 export const visible = (skill: Skill, cwd: string) => skill.scope === "global" || inside(skill.scope, cwd);
 const safeId = /^[a-f0-9]{64}$/;
+const pathKey = (path: string) => process.platform === "win32" ? resolve(path).toLowerCase() : resolve(path);
+const revisionPath = (root: string, skill: Skill) => skillPath(root, skill, skill.active);
 
 async function copyTree(source: string, target: string, replacement?: string) {
   const hash = createHash("sha256");
@@ -71,8 +75,7 @@ export async function register(store: Store, path: string, cwd: string, agentDir
     throw new Error("Choose a skill with a valid, non-reserved name in its frontmatter.");
   if (discovered.some((item) => item.name === name))
     throw new Error(`Exclude the original skill from Pi discovery and reload first (skills entry: ${JSON.stringify(`-${original}`)}).`);
-  const key = process.platform === "win32" ? original.toLowerCase() : original;
-  const skill: Skill = { id: digest(key), name, original, scope: global ? "global" : cwd, active: "", checks: [] };
+  const skill: Skill = { id: digest(pathKey(original)), name, original, scope: global ? "global" : cwd, active: "", checks: [] };
   skill.active = await createRevision(store.root, skill, original);
   const imported = skillPath(store.root, skill, skill.active);
   await validateFiles(imported, name, await readFile(imported, "utf8"));
@@ -86,21 +89,111 @@ export async function register(store: Store, path: string, cwd: string, agentDir
   });
 }
 
-export function pins(data: Data, session: string, cwd: string, file?: string, parentFile?: string, fork = false) {
+// Only a change detector: Pi still decides which files to load and supplies their provenance.
+export function skillInventory(agentDir: string, cwd: string, trusted: boolean) {
+  const roots = new Set([join(agentDir, "skills"), join(process.env.HOME || homedir(), ".agents", "skills")]);
+  if (trusted) {
+    roots.add(join(cwd, ".pi", "skills"));
+    for (let dir = cwd; ; dir = dirname(dir)) {
+      roots.add(join(dir, ".agents", "skills"));
+      if (existsSync(join(dir, ".git")) || dirname(dir) === dir) break;
+    }
+  }
+  return JSON.stringify([...roots].flatMap((dir) => loadSkillsFromDir({ dir, source: "evo-skills" }).skills
+    .filter((skill) => basename(skill.filePath) === "SKILL.md")
+    .map(({ filePath, name, description, disableModelInvocation }) =>
+      JSON.stringify([filePath, name, description, disableModelInvocation]))).sort());
+}
+
+export async function discover(store: Store, commands: ReturnType<ExtensionAPI["getCommands"]>, cwd: string) {
+  const { skills } = store.read();
+  const enrolled: string[] = [];
+  for (const command of commands) {
+    const info = command.sourceInfo;
+    if (command.source !== "skill" || info.origin !== "top-level" || info.source !== "auto" ||
+        !["user", "project"].includes(info.scope) || !info.baseDir) continue;
+    const original = resolve(info.path);
+    const name = command.name.slice("skill:".length);
+    if (basename(original) !== "SKILL.md" || !inside(join(info.baseDir, "skills"), original) ||
+        /(?:^|[\\/])(?:node_modules|\.git)(?:[\\/]|$)/i.test(original) ||
+        !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name) || name.length > 64 || name === "evo-skills") continue;
+    const scope = info.scope === "user" ? "global" : dirname(info.baseDir);
+    if (scope !== "global" && !inside(scope, cwd)) continue;
+    const id = digest(pathKey(original));
+    const previous = skills[id];
+    if (previous && (!previous.inPlace || previous.name !== name)) continue;
+    try {
+      const current = sourceFile(original);
+      const skill: Skill = previous ?? { id, name, original, scope, active: "", checks: [], inPlace: true };
+      if (!previous || !current.equals(readFileSync(revisionPath(store.root, previous)))) {
+        const revision = await createRevision(store.root, skill, original);
+        const snapshot = skillPath(store.root, skill, revision);
+        const content = await readFile(snapshot, "utf8");
+        await validateFiles(snapshot, name, content);
+        const tracked = store.update((data) => {
+          const live = data.skills[id];
+          if (live && !live.inPlace) return false;
+          if (!sourceFile(original).equals(Buffer.from(content))) return false;
+          data.skills[id] = { ...(live ?? skill), active: revision };
+          return true;
+        });
+        if (!tracked) continue;
+      }
+      enrolled.push(id);
+    } catch { /* Leave unsupported skills available to Pi without managing them. */ }
+  }
+  return enrolled;
+}
+
+export function pins(data: Data, session: string, cwd: string, file?: string, parentFile?: string, fork = false, enrolled: string[] = []) {
   const key = digest(session);
   const parent = parentFile && data.files[digest(resolve(parentFile))];
   const result = data.pins[key] ??= fork && parent && data.pins[parent]
     ? { ...data.pins[parent] }
-    : Object.fromEntries(Object.values(data.skills).filter((skill) => visible(skill, cwd)).map((skill) => [skill.id, skill.active]));
+    : Object.fromEntries(Object.values(data.skills).filter((skill) => !skill.inPlace && visible(skill, cwd)).map((skill) => [skill.id, skill.active]));
   if (file) data.files[digest(resolve(file))] = key;
-  return result;
+  return { ...result, ...Object.fromEntries(enrolled.map((id) => [id, data.skills[id].active])) };
 }
 
-export function adopt(data: Data, job: Job, revision: string) {
+function sourceFile(path: string) {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.size > 48 * 1024 || pathKey(realpathSync(path)) !== pathKey(path))
+    throw new Error("The original SKILL.md is no longer a regular file at its discovered path.");
+  return readFileSync(path);
+}
+
+export function matchesSource(root: string, skill: Skill) {
+  try { return sourceFile(skill.original).equals(readFileSync(revisionPath(root, skill))); } catch { return false; }
+}
+
+function replaceSource(root: string, skill: Skill, revision: string) {
+  if (!skill.inPlace) return;
+  const base = readFileSync(revisionPath(root, skill));
+  const next = readFileSync(skillPath(root, skill, revision));
+  const staged = join(dirname(skill.original), `.evo-skills-${randomUUID()}.tmp`);
+  if (!sourceFile(skill.original).equals(base)) throw new Error("The original SKILL.md changed; it was not overwritten.");
+  const mode = lstatSync(skill.original).mode & 0o777;
+  try {
+    writeFileSync(staged, next, { flag: "wx", mode });
+    if (!sourceFile(skill.original).equals(base)) throw new Error("The original SKILL.md changed; it was not overwritten.");
+    // shortcut: external editors can still race the final rename; use cooperation if concurrent editing needs hard guarantees.
+    renameSync(staged, skill.original);
+  } finally {
+    rmSync(staged, { force: true });
+  }
+}
+
+export function adopt(data: Data, job: Job, root: string, revision: string) {
   const skill = data.skills[job.skill];
   if (!skill || skill.active !== job.base) { job.state = "stale"; return false; }
+  try { replaceSource(root, skill, revision); } catch (error) {
+    job.state = "candidate";
+    job.note = error instanceof Error ? error.message : "Could not update the original SKILL.md.";
+    return false;
+  }
   skill.active = revision;
   job.state = "published";
+  job.note = undefined;
   return true;
 }
 
@@ -109,6 +202,7 @@ export async function rollback(store: Store, skill: Skill, revision: string) {
     throw new Error("Unknown revision.");
   store.update((data) => {
     if (data.skills[skill.id]?.active !== skill.active) throw new Error("The active revision changed; retry rollback.");
+    replaceSource(store.root, skill, revision);
     data.skills[skill.id].active = revision;
   });
 }

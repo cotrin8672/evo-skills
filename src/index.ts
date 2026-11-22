@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { collect } from "./collector.ts";
-import { adopt, pins, register, rollback, skillPath, validateFiles, visible } from "./registry.ts";
+import { adopt, discover, matchesSource, pins, rollback, skillInventory, skillPath, validateFiles, visible } from "./registry.ts";
 import { createRuntime, modelKey, scheduler } from "./scheduler.ts";
 import { digest, enqueue, leaseMs, Store, type Profile } from "./store.ts";
 import { diffBody, parseChecks } from "./validation.ts";
@@ -14,7 +14,7 @@ const command = "evo-skills";
 const subcommands = {
   status: "Show the queue, usage, and skill revisions",
   model: "Choose the improvement model",
-  track: "Register a skill to improve",
+  enable: "Opt in to automatic improvement of personal and project skills",
   checks: "Set evaluation fixtures",
   target: "Set the evaluation model",
   run: "Queue an improvement manually",
@@ -34,7 +34,10 @@ export default function evoSkills(pi: ExtensionAPI) {
   let selected: Record<string, string> = {};
   let cwd = "";
   let activeInput = false;
+  let previousLeaf: string | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let inventoryTimer: ReturnType<typeof setInterval> | undefined;
+  let refreshPending = false;
   const foreground = randomUUID();
   const availableModels = async () =>
     (await createRuntime(agentDir, AbortSignal.timeout(30_000))).getAvailableSnapshot();
@@ -44,6 +47,7 @@ export default function evoSkills(pi: ExtensionAPI) {
   const status = (ctx: ExtensionContext, message: string) => {
     if (ctx.hasUI) ctx.ui.setStatus(command, `Evo Skills: ${message}`);
   };
+  const isVisible = (skill: Parameters<typeof visible>[0]) => visible(skill, cwd) && (!skill.inPlace || !!selected[skill.id]);
   const markForeground = () => { store?.update((state) => { state.foreground[foreground] = Date.now() + leaseMs; }); };
   const clearForeground = () => {
     clearInterval(timer);
@@ -56,10 +60,33 @@ export default function evoSkills(pi: ExtensionAPI) {
     const legacy = join(agentDir, "skill-evolution");
     // Existing sessions pin real file paths, so leave their store where it is.
     const db = store = new Store(!existsSync(root) && existsSync(legacy) ? legacy : root);
+    const automatic = ctx.hasUI && db.read().config.automatic;
+    const inventory = automatic ? skillInventory(agentDir, cwd, ctx.isProjectTrusted()) : undefined;
+    const enrolled = automatic ? await discover(db, pi.getCommands(), cwd) : [];
+    previousLeaf = ctx.sessionManager.getLeafId() ?? undefined;
     selected = db.update((data) => pins(data, ctx.sessionManager.getSessionId(), cwd,
-      ctx.sessionManager.getSessionFile(), event.previousSessionFile, event.reason === "fork"));
-    runner = scheduler(db, agentDir, (message) => status(ctx, message));
+      ctx.sessionManager.getSessionFile(), event.previousSessionFile, event.reason === "fork", enrolled));
+    runner = scheduler(db, agentDir, (message, published) => {
+      status(ctx, message);
+      if (ctx.hasUI && published) ctx.ui.notify(`Evo Skills: Updated ${published.name}.${published.inPlace
+        ? "" : " Available in new sessions."} Review: /evo-skills diff ${published.id}`, "info");
+    }, createRuntime, isVisible);
     runner.wake();
+    if (inventory !== undefined) {
+      inventoryTimer = setInterval(() => {
+        if (refreshPending || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+        try {
+          if (skillInventory(agentDir, cwd, ctx.isProjectTrusted()) === inventory) return;
+          refreshPending = true;
+          // Pi only allows resource reloads from command context; dispatch without a model turn.
+          pi.sendUserMessage(`/${command} _refresh ${foreground}`, { expandPromptTemplates: true });
+        } catch {
+          refreshPending = false;
+          status(ctx, "Could not check for skill changes.");
+        }
+      }, 2_000);
+      inventoryTimer.unref();
+    }
   });
   pi.on("resources_discover", (_event, ctx) => {
     const data = store?.read();
@@ -67,7 +94,7 @@ export default function evoSkills(pi: ExtensionAPI) {
     const skillPaths = [];
     for (const [id, revision] of Object.entries(selected)) {
       const skill = data?.skills[id];
-      if (!skill || !visible(skill, cwd)) continue;
+      if (!skill || skill.inPlace || !visible(skill, cwd)) continue;
       if (ordinary.has(`skill:${skill.name}`)) status(ctx, `Duplicate skill ${skill.name}; exclude its original and reload.`);
       else if (store) skillPaths.push(skillPath(store.root, skill, revision));
     }
@@ -80,20 +107,25 @@ export default function evoSkills(pi: ExtensionAPI) {
     timer = setInterval(() => { try { markForeground(); } catch { /* Lease expires on shutdown. */ } }, 5_000);
     timer.unref();
   });
-  pi.on("session_tree", () => { activeInput = false; });
+  pi.on("session_tree", (_event, ctx) => {
+    activeInput = false;
+    previousLeaf = ctx.sessionManager.getLeafId() ?? undefined;
+  });
   pi.on("agent_settled", (event, ctx) => {
     try {
-      if (store && activeInput && ctx.hasUI)
-        collect(store, ctx, selected, profile(ctx), event.aborted, (type) => pi.appendEntry(type));
+      if (store && activeInput && ctx.hasUI && Object.keys(selected).length)
+        collect(store, ctx, selected, profile(ctx), event.aborted, (type) => pi.appendEntry(type), previousLeaf);
     } catch {
       status(ctx, "Could not record skill usage");
     } finally {
       activeInput = false;
+      previousLeaf = ctx.sessionManager.getLeafId() ?? undefined;
       clearForeground();
       runner?.wake();
     }
   });
   pi.on("session_shutdown", () => {
+    clearInterval(inventoryTimer);
     try { clearForeground(); } finally {
       void runner?.close().catch(() => {});
       runner = undefined;
@@ -110,7 +142,7 @@ export default function evoSkills(pi: ExtensionAPI) {
         choices.filter((name) => name.toLowerCase().includes(partial.toLowerCase()))
           .map((name) => ({ value: start + name, label: name }));
       if (target) {
-        const skills = Object.values(store?.read().skills ?? {}).filter((skill) => visible(skill, cwd));
+        const skills = Object.values(store?.read().skills ?? {}).filter(isVisible);
         return complete("target ", target[1], skills.map(({ name }) => name).sort());
       }
       if (selection) {
@@ -143,11 +175,18 @@ export default function evoSkills(pi: ExtensionAPI) {
         const state = db.read();
         const notify = (message: string) => ctx.ui.notify(message, "info");
         const find = () => {
-          const skill = Object.values(state.skills).find((item) => item.name === name && visible(item, cwd));
+          const skill = Object.values(state.skills).find((item) => item.name === name && isVisible(item));
           if (!skill) throw new Error(`Unknown managed skill: ${name ?? "(missing)"}`);
           return skill;
         };
-        if (action === "model") {
+        if (action === "_refresh" && arg === foreground) {
+          try {
+            if (ctx.isIdle() && !ctx.hasPendingMessages()) await ctx.reload();
+          } finally {
+            refreshPending = false;
+          }
+          return;
+        } else if (action === "model") {
           const choices = (await availableModels()).map(modelKey).sort();
           if (!choices.length) throw new Error("No models available in Pi's standalone configuration.");
           const id = name || await ctx.ui.select("Evo Skills model", choices);
@@ -157,13 +196,14 @@ export default function evoSkills(pi: ExtensionAPI) {
           if (detail && !thinking) throw new Error(`Thinking level must be one of: ${levels.join(", ")}`);
           db.update((data) => { data.config.model = { id, thinking }; });
           notify(`Evo Skills model: ${id}`);
-        } else if (action === "track") {
-          if (!arg) throw new Error("Provide the path to SKILL.md.");
-          const discovered = pi.getCommands().filter((cmd) => cmd.source === "skill")
-            .filter((cmd) => !resolve(cmd.sourceInfo.path).startsWith(resolve(db.root) + sep))
-            .map((cmd) => ({ name: cmd.name.replace(/^skill:/, "") }));
-          const skill = await register(db, resolve(cwd, arg), cwd, agentDir, discovered);
-          notify(`Tracking ${skill.name} at ${skill.active}. New sessions will use the managed copy.`);
+        } else if (action === "enable") {
+          if (state.config.automatic) { notify("Automatic skill improvement is already enabled."); return; }
+          if (!await ctx.ui.confirm("Enable automatic skill improvement?",
+            "Evo Skills can send skill content and excerpts from future skill-using turns to the improvement model. Passing revisions can update personal and trusted project SKILL.md files.")) return;
+          db.update((data) => { data.config.automatic = true; });
+          notify("Automatic skill improvement enabled.");
+          await ctx.reload();
+          return;
         } else if (action === "checks") {
           const skill = find();
           if (!detail) throw new Error("Usage: checks <skill> <fixtures.json>");
@@ -183,12 +223,13 @@ export default function evoSkills(pi: ExtensionAPI) {
           notify(`${skill.name}: evaluation model ${id}.`);
         } else if (action === "run") {
           const skill = find();
+          if (skill.inPlace && !matchesSource(db.root, skill)) throw new Error("Reload to pick up changes to this skill.");
           const text = (await ctx.ui.input("Observation (will be sent to the improvement model)"))?.trim();
           if (!text) return;
           if (text.length > 4_000) throw new Error("Observation exceeds 4,000 characters.");
           const id = digest(randomUUID());
           const job = db.update((data) => enqueue(data, {
-            id, skill: skill.id, base: selected[skill.id] ?? skill.active, cwd, session: ctx.sessionManager.getSessionId(),
+            id, skill: skill.id, base: skill.inPlace ? skill.active : selected[skill.id] ?? skill.active, cwd, session: ctx.sessionManager.getSessionId(),
             through: id, usage: "explicitly requested improvement", text, target: profile(ctx),
           }, Date.now(), true));
           if (!job) throw new Error("This session is pinned to an older revision. Start a new session to improve the active version.");
@@ -208,7 +249,7 @@ export default function evoSkills(pi: ExtensionAPI) {
         } else if (action === "diff" || action === "apply" || action === "reevaluate") {
           const job = name && Object.hasOwn(state.jobs, name) ? state.jobs[name] : undefined;
           const skill = job && state.skills[job.skill];
-          if (!job?.candidate || !skill || !visible(skill, cwd)) throw new Error("No visible candidate for that job.");
+          if (!job?.candidate || !skill || !isVisible(skill)) throw new Error("No visible candidate for that job.");
           const path = skillPath(db.root, skill, job.candidate);
           if (action === "reevaluate") {
             db.update((data) => {
@@ -227,10 +268,10 @@ export default function evoSkills(pi: ExtensionAPI) {
             await validateFiles(path, skill.name, await readFile(path, "utf8"));
             const applied = db.update((data) => {
               const current = data.jobs[job.id];
-              return current.state === "candidate" && adopt(data, current, job.candidate!);
+              return current.state === "candidate" && adopt(data, current, db.root, job.candidate!);
             });
-            if (!applied) throw new Error("The base revision changed; candidate not applied.");
-            notify(`Published ${skill.name}; existing sessions keep their assigned revisions.`);
+            if (!applied) throw new Error(db.read().jobs[job.id].note ?? "The base revision changed; candidate not applied.");
+            notify(`Updated ${skill.name}.${skill.inPlace ? "" : " Available in new sessions."}`);
           } else {
             const before = skillPath(db.root, skill, job.base);
             const details = `${job.state}: ${job.rationale ?? job.note ?? ""}\nEvidence: ${job.usedEvidence?.join(", ") ?? ""}\n${JSON.stringify(job.validation ?? {})}\n\nBefore: ${before}\nAfter: ${path}`;
@@ -240,15 +281,17 @@ export default function evoSkills(pi: ExtensionAPI) {
           }
         } else if (action === "rollback") {
           if (!detail) throw new Error("Usage: rollback <skill> <revision>");
-          await rollback(db, find(), detail);
-          notify("Rolled back the active revision for new sessions.");
+          const skill = find();
+          await rollback(db, skill, detail);
+          notify(`Rolled back ${skill.name}.${skill.inPlace ? "" : " Available in new sessions."}`);
         } else if (!action || action === "status") {
-          const recent = Object.values(state.jobs).filter((job) => state.skills[job.skill] && visible(state.skills[job.skill], cwd))
+          const recent = Object.values(state.jobs).filter((job) => state.skills[job.skill] && isVisible(state.skills[job.skill]))
             .slice(-12).reverse().map((job) => `${state.skills[job.skill].name} ${job.state} ${job.id}${job.note ? ` · ${job.note}` : ""}`);
           await ctx.ui.editor("Evo Skills status (review only)",
-            [`${state.config.paused ? "Paused" : "Enabled"} · model: ${state.config.model?.id ?? "not configured"}`,
+            [`${state.config.paused ? "Paused" : "Ready"} · automatic discovery: ${state.config.automatic ? "on" : "off"} · model: ${state.config.model?.id ?? "not configured"}`,
               `${state.calls} calls · ${state.tokens} tokens · $${state.cost.toFixed(4)}`,
-              ...Object.values(state.skills).filter((skill) => visible(skill, cwd)).map((skill) => `${skill.name}: active ${skill.active}, session ${selected[skill.id] ?? "not pinned"}`),
+              ...Object.values(state.skills).filter(isVisible)
+                .map((skill) => `${skill.name}: active ${skill.active}, ${skill.inPlace ? "in place" : `session ${selected[skill.id] ?? "not pinned"}`}`),
               ...recent].join("\n"));
         } else throw new Error(`Commands: ${Object.keys(subcommands).join(", ")}.`);
         runner?.wake();

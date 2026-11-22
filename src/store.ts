@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 export const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 export type Profile = { id: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" };
 export type Check = { kind: "regression" | "repair" | "non_applicable"; task: string; includes: string[]; excludes?: string[] };
-export type Skill = { id: string; name: string; original: string; scope: string; active: string; checks: Check[]; target?: Profile };
+export type Skill = { id: string; name: string; original: string; scope: string; active: string; checks: Check[]; target?: Profile; inPlace?: true };
 export type Evidence = {
   id: string; skill: string; base: string; session: string; through: string; from?: string;
   file?: string; previous?: string; text?: string; usage: string;
@@ -19,7 +19,7 @@ export type Job = {
   started?: number; candidate?: string; note?: string; validation?: unknown; calls?: number; tokens?: number; cost?: number;
   optimizerRevision?: string; rationale?: string; usedEvidence?: string[];
 };
-export type Config = { model?: Profile; paused?: boolean; idleMs?: number; cooldownMs?: number; jobsPerDay?: number; callsPerJob?: number; outputTokens?: number; timeoutMs?: number };
+export type Config = { model?: Profile; automatic?: boolean; paused?: boolean; idleMs?: number; cooldownMs?: number; jobsPerDay?: number; callsPerJob?: number; outputTokens?: number; timeoutMs?: number };
 export type Data = {
   config: Config; skills: Record<string, Skill>; pins: Record<string, Record<string, string>>;
   files: Record<string, string>; evidence: Record<string, Evidence>; jobs: Record<string, Job>;
@@ -81,7 +81,7 @@ export function enqueue(data: Data, item: Evidence, now = Date.now(), manual = f
 }
 
 export const leaseMs = 30_000;
-export function claim(data: Data, owner: string, now = Date.now()) {
+export function claim(data: Data, owner: string, now = Date.now(), available: (skill: Skill) => boolean = () => true) {
   for (const job of Object.values(data.jobs)) {
     if (job.owner && (job.lease ?? 0) <= now) {
       job.owner = undefined;
@@ -95,7 +95,9 @@ export function claim(data: Data, owner: string, now = Date.now()) {
     data.attempts.length >= (data.config.jobsPerDay ?? 6) || Object.values(data.jobs).some((job) => job.owner)) return;
   for (const job of Object.values(data.jobs).sort((a, b) => a.due - b.due)) {
     if (!["queued", "interrupted"].includes(job.state) || job.due > now) continue;
-    if (data.skills[job.skill]?.active !== job.base) { job.state = "stale"; continue; }
+    const skill = data.skills[job.skill];
+    if (skill?.active !== job.base) { job.state = "stale"; continue; }
+    if (!available(skill)) continue;
     job.state = "running";
     job.attempt++;
     job.started = now;

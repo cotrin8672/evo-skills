@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { skillPath, visible } from "./registry.ts";
+import { matchesSource, skillPath, visible } from "./registry.ts";
 import { digest, enqueue, type Evidence, type Profile, type Store } from "./store.ts";
 
 type Entry = ReturnType<ExtensionContext["sessionManager"]["getBranch"]>[number];
@@ -42,50 +42,63 @@ export function evidenceText(item: Evidence) {
   return JSON.stringify(materialize(branch, item.from)).slice(0, 8000);
 }
 
-export function collect(store: Store, ctx: ExtensionContext, pin: Record<string, string>, target: Profile | undefined, aborted: boolean, append: (id: string) => void) {
+export function collect(store: Store, ctx: ExtensionContext, pin: Record<string, string>, target: Profile | undefined, aborted: boolean, append: (id: string) => void, previousLeaf?: string) {
   const branch = ctx.sessionManager.getBranch();
   const end = branch.at(-1);
   if (!end || isBoundary(end)) return;
   const index = branch.findLastIndex(isBoundary);
+  const leafIndex = previousLeaf ? branch.findIndex((entry) => entry.id === previousLeaf) : -1;
   const latest = branch.slice(index + 1).filter((entry) => entry.type === "message");
   if (!latest.some((entry) => entry.message.role === "user")) return;
 
   const state = store.read();
+  if (state.config.paused) return;
   const usage = new Map<string, { kind: string; entry: string }>();
   const paths = new Map<string, string>();
   for (const skill of Object.values(state.skills)) if (pin[skill.id] && visible(skill, ctx.cwd))
-    paths.set(pathKey(skillPath(store.root, skill, pin[skill.id])), skill.id);
-  const reads = new Map<string, { path: string; partial: boolean }>();
-  for (const entry of branch) {
+    paths.set(pathKey(skill.inPlace ? skill.original : skillPath(store.root, skill, pin[skill.id])), skill.id);
+  const reads = new Map<string, { path: string; partial: boolean; index: number }>();
+  const record = (id: string, kind: string, entry: Entry, at: number) => {
+    if (state.skills[id].inPlace && (kind === "read failed" || at <= leafIndex || (previousLeaf && leafIndex < 0))) return;
+    if (!usage.has(id) || kind !== "read failed") usage.set(id, { kind, entry: entry.id });
+  };
+  const scanFrom = Object.keys(pin).some((id) => !state.skills[id]?.inPlace) ? 0 : leafIndex + 1;
+  for (let i = scanFrom; i < branch.length; i++) {
+    const entry = branch[i];
     if (entry.type !== "message") continue;
     const m = entry.message;
     if (m.role === "user") {
       const hit = /^<skill name="[^"]+" location="([^"]+)">/.exec(words(m.content));
       const id = hit && paths.get(pathKey(hit[1]));
-      if (id) usage.set(id, { kind: "expanded /skill", entry: entry.id });
+      if (id) record(id, "expanded /skill", entry, i);
     } else if (m.role === "assistant") {
       for (const part of m.content) if (part.type === "toolCall" && part.name === "read" && typeof part.arguments.path === "string")
-        reads.set(part.id, { path: resolve(ctx.cwd, part.arguments.path), partial: part.arguments.offset !== undefined || part.arguments.limit !== undefined });
+        reads.set(part.id, { path: resolve(ctx.cwd, part.arguments.path), partial: part.arguments.offset !== undefined || part.arguments.limit !== undefined, index: i });
     } else if (m.role === "toolResult" && m.toolName === "read") {
       const input = reads.get(m.toolCallId);
       const id = input && paths.get(pathKey(input.path));
       if (id && input) {
         const kind = m.isError ? "read failed" : input.partial || !!(m.details as { truncation?: unknown } | undefined)?.truncation ? "partial read" : "read";
-        if (!usage.has(id) || kind !== "read failed") usage.set(id, { kind, entry: entry.id });
+        record(id, kind, entry, input.index);
       }
     }
   }
+  for (const id of usage.keys()) if (state.skills[id].inPlace && !matchesSource(store.root, state.skills[id])) usage.delete(id);
   if (!usage.size) return;
   const session = ctx.sessionManager.getSessionId();
   const file = ctx.sessionManager.getSessionFile();
-  const from = branch[index]?.id;
   store.update((data) => {
+    if (data.config.paused) return;
     for (const [skill, seen] of usage) {
-      const id = digest(JSON.stringify([session, end.id, skill, pin[skill], "v1"]));
+      const inPlace = state.skills[skill].inPlace;
+      const base = inPlace ? state.skills[skill].active : pin[skill];
+      if (inPlace && data.skills[skill]?.active !== base) continue;
+      const from = branch[inPlace ? leafIndex : index]?.id;
+      const id = digest(JSON.stringify([session, end.id, skill, base, "v1"]));
       const previous = Object.values(data.evidence).findLast((item) => item.skill === skill && item.session === session &&
-        branch.slice(0, index + 1).some((entry) => entry.id === item.through));
+        branch.slice(0, (inPlace ? leafIndex : index) + 1).some((entry) => entry.id === item.through));
       enqueue(data, {
-        id, skill, base: pin[skill], session, through: end.id, from, file, previous: previous?.id,
+        id, skill, base, session, through: end.id, from, file, previous: previous?.id,
         usage: `${seen.kind} (${seen.entry}); does not establish effectiveness`, target, aborted, cwd: ctx.cwd,
         text: file ? undefined : JSON.stringify(materialize(branch, from)).slice(0, 8000),
       });

@@ -6,14 +6,15 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { evidenceText } from "./collector.ts";
 import { optimizer, propose, readSkill, type Meter, type WorkerOptions } from "./evolver.ts";
 import { adopt, createRevision, skillPath, validateFiles } from "./registry.ts";
-import { claim, digest, leaseMs, owns, type Job, type Profile, type Store } from "./store.ts";
+import { claim, digest, leaseMs, owns, type Job, type Profile, type Skill, type Store } from "./store.ts";
 import { evaluate } from "./validation.ts";
 
 export const modelKey = (model: { provider: string; id: string }) => `${model.provider}/${model.id}`;
 export const createRuntime = (agentDir: string, signal?: AbortSignal) =>
   ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json"), signal });
 
-export function scheduler(store: Store, agentDir: string, show: (status: string) => void, runtimeForJob = createRuntime) {
+export function scheduler(store: Store, agentDir: string, show: (status: string, published?: { name: string; id: string; inPlace?: true }) => void,
+  runtimeForJob = createRuntime, available: (skill: Skill) => boolean = () => true) {
   const owner = randomUUID();
   let running: Promise<void> | undefined;
   let stop: AbortController | undefined;
@@ -22,7 +23,7 @@ export function scheduler(store: Store, agentDir: string, show: (status: string)
     if (closed || running) return;
     const data = store.read();
     if (!Object.values(data.jobs).some((job) => job.owner || ["queued", "interrupted"].includes(job.state))) return;
-    const job = store.update((state) => claim(state, owner));
+    const job = store.update((state) => claim(state, owner, Date.now(), available));
     if (!job) return;
     const control = stop = new AbortController();
     running = run(job, control).catch(() => show("Could not save job state")).finally(() => { running = undefined; stop = undefined; });
@@ -37,6 +38,7 @@ export function scheduler(store: Store, agentDir: string, show: (status: string)
     const timeout = AbortSignal.timeout(data.config.timeoutMs ?? 300_000);
     const signal = AbortSignal.any([control.signal, timeout]);
     const meter: Meter = { tokens: 0, cost: 0 };
+    let published = false;
     const lease = setInterval(() => {
       try {
         if (!store.update((state) => {
@@ -130,21 +132,24 @@ export function scheduler(store: Store, agentDir: string, show: (status: string)
         validation = { passed: false, reason: error instanceof Error ? error.message.slice(0, 500) : "Evaluation unavailable." };
       }
       control.signal.throwIfAborted();
-      transition((current, state) => {
+      const saved = transition((current, state) => {
         control.signal.throwIfAborted();
         current.validation = validation;
         if (state.skills[current.skill]?.active !== current.base) current.state = "stale";
-        else if (!timeout.aborted && validation.passed) adopt(state, current, candidate);
+        else if (!timeout.aborted && validation.passed) published = adopt(state, current, store.root, candidate);
         else current.state = "candidate";
       }, true);
+      if (!saved) published = false;
     } catch (error) {
+      published = false;
       transition((current) => {
         current.state = control.signal.aborted ? "interrupted" : "failed";
         current.note = timeout.aborted ? "Job timed out." : (error instanceof Error ? error.message : "Job failed.").slice(0, 500);
       }, true);
     } finally {
       clearInterval(lease);
-      if (!closed) show(`${skill.name}: ${store.read().jobs[job.id]?.state ?? "unknown"}`);
+      if (!closed) show(`${skill.name}: ${store.read().jobs[job.id]?.state ?? "unknown"}`,
+        published ? { name: skill.name, id: job.id, inPlace: skill.inPlace } : undefined);
     }
   }
   return {

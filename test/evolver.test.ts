@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, type ExtensionUIContext, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
@@ -92,6 +93,99 @@ for (const directory of ["evo-skills", "skill-evolution"]) test(`Pi loads Evo Sk
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     await rm(dir, { recursive: true, force: true }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EBUSY") throw error;
+    });
+  }
+});
+
+test("one opt-in automatically discovers later additions without reloading another project", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "evo-skills-discovery-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  const store = new Store(join(dir, "evo-skills"));
+  try {
+    const addSkill = async (skills: string, name: string) => {
+      const path = join(skills, name, "SKILL.md");
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, `---\nname: ${name}\ndescription: An example\n---\nRecord the exit code.\n`);
+      return path;
+    };
+    const globalSkills = join(dir, "skills");
+    const original = await addSkill(globalSkills, "personal");
+    const first = join(dir, "first");
+    const second = join(dir, "second");
+    const firstSkills = join(first, ".pi", "skills");
+    const firstSkill = await addSkill(firstSkills, "first-skill");
+    const pkg = fileURLToPath(new URL("../", import.meta.url));
+    await writeFile(join(dir, "settings.json"), JSON.stringify({ packages: [pkg] }));
+    const faux = fauxProvider({ tokensPerSecond: Infinity });
+    const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
+    runtime.registerNativeProvider(faux.provider);
+    const model = runtime.getModels(faux.provider.id)[0];
+    assert.ok(model);
+    const open = async (cwd: string) => {
+      const settingsManager = SettingsManager.create(cwd, dir, { projectTrusted: true });
+      const loader = new DefaultResourceLoader({ cwd, agentDir: dir, settingsManager });
+      await loader.reload();
+      const { session } = await createAgentSession({
+        cwd, model, modelRuntime: runtime, settingsManager, resourceLoader: loader, sessionManager: SessionManager.inMemory(cwd),
+      });
+      try {
+        await session.bindExtensions({
+          mode: "rpc",
+          uiContext: { confirm: async () => true, notify() {}, setStatus() {} } as Partial<ExtensionUIContext> as ExtensionUIContext,
+          commandContextActions: {
+            reload: () => session.reload(), waitForIdle: () => session.waitForIdle(),
+            newSession: async () => ({ cancelled: true }), fork: async () => ({ cancelled: true }),
+            navigateTree: async () => ({ cancelled: true }), switchSession: async () => ({ cancelled: true }),
+          },
+        });
+        return { session, loader };
+      } catch (error) {
+        await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+        session.dispose();
+        throw error;
+      }
+    };
+    const { session, loader } = await open(first);
+    let lateGlobal: string;
+    try {
+      assert.deepEqual(Object.keys(store.read().skills), []);
+      await session.prompt("/evo-skills enable", { source: "rpc" });
+      assert.equal(store.read().config.automatic, true);
+      assert.deepEqual(Object.values(store.read().skills).map(({ original }) => original).sort(), [original, firstSkill].sort());
+
+      lateGlobal = await addSkill(globalSkills, "late-global");
+      const lateProject = await addSkill(join(first, ".agents", "skills"), "late-project");
+      const until = Date.now() + 9_000;
+      while (Object.keys(store.read().skills).length < 4 && Date.now() < until) await delay(25);
+      assert.equal(Object.keys(store.read().skills).length, 4);
+      assert.deepEqual(loader.getSkills().skills.map(({ filePath }) => filePath).sort(), [original, firstSkill, lateGlobal, lateProject].sort());
+      assert.deepEqual(session.messages, []);
+      faux.setResponses([fauxAssistantMessage("Done."), fauxAssistantMessage("Done.")]);
+      await session.prompt("/skill:late-project Review the task.", { source: "rpc" });
+      await session.prompt("Unrelated question.", { source: "rpc" });
+      assert.equal(Object.keys(store.read().evidence).length, 1);
+    } finally {
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      session.dispose();
+    }
+    const secondSkill = await addSkill(join(second, ".pi", "skills"), "second-skill");
+    const next = await open(second);
+    try {
+      assert.deepEqual(next.loader.getSkills().skills.map(({ filePath }) => filePath).sort(), [original, lateGlobal, secondSkill].sort());
+      const command = next.session.extensionRunner.getRegisteredCommands().find((cmd) => cmd.name === "evo-skills");
+      assert.deepEqual((await command?.getArgumentCompletions?.("target "))?.map(({ value }) => value),
+        ["target late-global", "target personal", "target second-skill"]);
+    } finally {
+      await next.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      next.session.dispose();
+    }
+  } finally {
+    store.close();
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(dir, { recursive: true, force: true, maxRetries: 8 }).catch((error: NodeJS.ErrnoException) => {
       if (error.code !== "EBUSY") throw error;
     });
   }

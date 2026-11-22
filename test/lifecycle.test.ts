@@ -2,18 +2,24 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { pins, register, rollback, skillPath } from "../src/registry.ts";
+import { type ExtensionAPI, type ExtensionContext, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { collect } from "../src/collector.ts";
+import { adopt, createRevision, discover, pins, register, rollback, skillPath } from "../src/registry.ts";
 import { modelKey, scheduler } from "../src/scheduler.ts";
 import { claim, enqueue, leaseMs, owns, Store } from "../src/store.ts";
 
 const source = "---\nname: example\ndescription: Example procedure\n---\nUse the old procedure.\n";
 const candidate = source.replace("the old procedure", "the revised procedure");
+
+function skillCommand(path: string, baseDir: string, scope: "user" | "project" | "temporary" = "project",
+  origin: "top-level" | "package" = "top-level", label = "auto"): ReturnType<ExtensionAPI["getCommands"]>[number] {
+  return { name: "skill:example", source: "skill", sourceInfo: { path, baseDir, scope, origin, source: label } };
+}
 
 async function setup() {
   const root = await mkdtemp(join(tmpdir(), "evo-skills-life-"));
@@ -103,7 +109,10 @@ test("queue generates, validates, adopts, pins older and forked sessions, and ro
   ]);
   // The faux provider has no configured credential; the test explicitly exposes its sole model.
   runtime.getAvailableSnapshot = () => [model];
-  const runner = scheduler(store, root, () => {}, async () => runtime);
+  const announcements: string[] = [];
+  const runner = scheduler(store, root, (_status, published) => {
+    if (published) announcements.push(published.id);
+  }, async () => runtime);
   const inspect = new Store(store.root);
   try {
     runner.wake();
@@ -114,6 +123,7 @@ test("queue generates, validates, adopts, pins older and forked sessions, and ro
       job = inspect.read().jobs[jobId];
     }
     assert.equal(job.state, "published", JSON.stringify(job));
+    assert.deepEqual(announcements, [jobId]);
     assert.equal(job.calls, 14);
     const changed = inspect.read().skills[skill.id];
     assert.notEqual(changed.active, skill.active);
@@ -129,6 +139,58 @@ test("queue generates, validates, adopts, pins older and forked sessions, and ro
   } finally {
     await runner.close();
     inspect.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 8 }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EBUSY") throw error;
+    });
+  }
+});
+
+test("automatic discovery observes only eligible skills used in the current turn and never overwrites prior edits", async () => {
+  const root = await mkdtemp(join(tmpdir(), "evo-skills-auto-"));
+  const store = new Store(join(root, "state"));
+  try {
+    const baseDir = join(root, ".pi");
+    const original = join(baseDir, "skills", "example", "SKILL.md");
+    const bundled = join(baseDir, "skills", "bundled", "SKILL.md");
+    for (const path of [original, bundled]) {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, source);
+    }
+    const commands = [skillCommand(original, baseDir), skillCommand(bundled, baseDir, "project", "package"),
+      skillCommand(bundled, baseDir, "temporary", "top-level", "extension:example")];
+    const enrolled = await discover(store, commands, root);
+    assert.equal(enrolled.length, 1);
+    const skill = store.read().skills[enrolled[0]];
+    assert.equal(skill.original, original);
+    const selected = store.update((data) => pins(data, "s", root, undefined, undefined, false, enrolled));
+    const turn = (id: string, path: string) => ({
+      type: "message", id, message: { role: "user", content: `<skill name="example" location="${path}">` },
+    });
+    const ownTurn = turn("first", original);
+    const foreignTurn = turn("second", bundled);
+    let branch = [ownTurn, foreignTurn];
+    const ctx = { cwd: root, sessionManager: { getSessionId: () => "s", getBranch: () => branch, getSessionFile: () => undefined } } as unknown as ExtensionContext;
+    collect(store, ctx, selected, undefined, false, () => assert.fail("bundled skill was observed"), ownTurn.id);
+    assert.deepEqual(store.read().evidence, {});
+    branch = [...branch, turn("third", original)];
+    collect(store, ctx, selected, undefined, false, () => {}, foreignTurn.id);
+    const [job] = Object.values(store.read().jobs);
+    assert.ok(job);
+    const revision = await createRevision(store.root, skill, original, candidate);
+    const edited = source.replace("old", "hand-edited");
+    await writeFile(original, edited);
+    const publish = () => store.update((data) => adopt(data, data.jobs[job.id], store.root, revision));
+    assert.equal(publish(), false);
+    assert.equal(await readFile(original, "utf8"), edited);
+    assert.equal(store.read().jobs[job.id].state, "candidate");
+    await writeFile(original, source);
+    assert.equal(publish(), true);
+    assert.equal(await readFile(original, "utf8"), candidate);
+    assert.equal(await readFile(skillPath(store.root, skill, skill.active), "utf8"), source);
+    await rollback(store, store.read().skills[skill.id], skill.active);
+    assert.equal(await readFile(original, "utf8"), source);
+  } finally {
+    store.close();
     await rm(root, { recursive: true, force: true, maxRetries: 8 }).catch((error: NodeJS.ErrnoException) => {
       if (error.code !== "EBUSY") throw error;
     });
